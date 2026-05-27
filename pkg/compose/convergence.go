@@ -391,6 +391,7 @@ func checkExpectedVolumes(expected types.ServiceConfig, actual container.Summary
 		if hasTaskSlotTemplate(id) {
 			number, err := strconv.Atoi(actual.Labels[api.ContainerNumberLabel])
 			if err != nil {
+				logrus.Warnf("container %s has invalid %s label: %s", actual.ID, api.ContainerNumberLabel, actual.Labels[api.ContainerNumberLabel])
 				return true
 			}
 			id = resolveTaskSlot(id, number)
