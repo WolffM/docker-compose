@@ -166,7 +166,7 @@ func TestBuildContainerMountOptions(t *testing.T) {
 	}
 	mock.EXPECT().ImageInspect(gomock.Any(), "myProject-myService").AnyTimes().Return(client.ImageInspectResult{}, nil)
 
-	mounts, err := s.buildContainerMountOptions(t.Context(), project, project.Services["myService"], inherit)
+	mounts, err := s.buildContainerMountOptions(t.Context(), project, project.Services["myService"], inherit, 1)
 	sort.Slice(mounts, func(i, j int) bool {
 		return mounts[i].Target < mounts[j].Target
 	})
@@ -178,7 +178,7 @@ func TestBuildContainerMountOptions(t *testing.T) {
 	assert.Equal(t, mounts[2].VolumeOptions.Subpath, "etc")
 	assert.Equal(t, mounts[3].Target, "\\\\.\\pipe\\docker_engine")
 
-	mounts, err = s.buildContainerMountOptions(t.Context(), project, project.Services["myService"], inherit)
+	mounts, err = s.buildContainerMountOptions(t.Context(), project, project.Services["myService"], inherit, 1)
 	sort.Slice(mounts, func(i, j int) bool {
 		return mounts[i].Target < mounts[j].Target
 	})
@@ -374,6 +374,7 @@ func Test_buildContainerVolumes(t *testing.T) {
 		yaml   string
 		binds  []string
 		mounts []mountTypes.Mount
+		number int
 	}{
 		{
 			name: "bind mount local path",
@@ -461,6 +462,21 @@ volumes:
 				},
 			},
 		},
+		{
+			name: "mount volume with replica slot in name",
+			yaml: `
+services:
+  test:
+    volumes:
+      - data:/data
+volumes:
+  data:
+    name: 'my_volume_{{.Task.Slot}}'
+`,
+			binds:  []string{"my_volume_2:/data:rw"},
+			mounts: nil,
+			number: 2,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -477,7 +493,11 @@ volumes:
 			})
 			assert.NilError(t, err)
 			s := &composeService{}
-			binds, mounts, err := s.buildContainerVolumes(t.Context(), *p, p.Services["test"], nil)
+			number := tt.number
+			if number == 0 {
+				number = 1
+			}
+			binds, mounts, err := s.buildContainerVolumes(t.Context(), *p, p.Services["test"], nil, number)
 			assert.NilError(t, err)
 			assert.DeepEqual(t, tt.binds, binds)
 			assert.DeepEqual(t, tt.mounts, mounts)
