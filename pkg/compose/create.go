@@ -59,6 +59,8 @@ type createConfigs struct {
 	Links     []string
 }
 
+const taskSlotTemplate = "{{.Task.Slot}}"
+
 func (s *composeService) Create(ctx context.Context, project *types.Project, createOpts api.CreateOptions) error {
 	return Run(ctx, func(ctx context.Context) error {
 		return s.create(ctx, project, createOpts)
@@ -155,6 +157,18 @@ func (s *composeService) ensureProjectVolumes(ctx context.Context, project *type
 		volume.CustomLabels = volume.CustomLabels.Add(api.VolumeLabel, k)
 		volume.CustomLabels = volume.CustomLabels.Add(api.ProjectLabel, project.Name)
 		volume.CustomLabels = volume.CustomLabels.Add(api.VersionLabel, api.ComposeVersion)
+		if hasTaskSlotTemplate(volume.Name) {
+			ids[k] = volume.Name
+			scale := maxServiceScaleForVolume(project, k)
+			for i := 1; i <= scale; i++ {
+				replicaVolume := volume
+				replicaVolume.Name = resolveTaskSlot(volume.Name, i)
+				if _, err := s.ensureVolume(ctx, k, replicaVolume, project); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
 		id, err := s.ensureVolume(ctx, k, volume, project)
 		if err != nil {
 			return nil, err
@@ -242,7 +256,7 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 		k, v, _ := strings.Cut(t, ":")
 		tmpfs[k] = v
 	}
-	binds, mounts, err := s.buildContainerVolumes(ctx, *p, service, inherit)
+	binds, mounts, err := s.buildContainerVolumes(ctx, *p, service, inherit, number)
 	if err != nil {
 		return createConfigs{}, err
 	}
@@ -861,11 +875,12 @@ func (s *composeService) buildContainerVolumes(
 	p types.Project,
 	service types.ServiceConfig,
 	inherit *container.Summary,
+	number int,
 ) ([]string, []mount.Mount, error) {
 	var mounts []mount.Mount
 	var binds []string
 
-	mountOptions, err := s.buildContainerMountOptions(ctx, p, service, inherit)
+	mountOptions, err := s.buildContainerMountOptions(ctx, p, service, inherit, number)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -893,10 +908,14 @@ func (s *composeService) buildContainerVolumes(
 		case mount.TypeVolume:
 			v := findVolumeByTarget(service.Volumes, m.Target)
 			vol := findVolumeByName(p.Volumes, m.Source)
-			if v != nil && vol != nil {
+			if v != nil {
 				// Prefer the bind API if no advanced option is used, to preserve backward compatibility
 				if !volumeRequiresMountAPI(v.Volume) {
-					binds = append(binds, toBindString(vol.Name, v))
+					source := m.Source
+					if vol != nil {
+						source = vol.Name
+					}
+					binds = append(binds, toBindString(source, v))
 					continue
 				}
 			}
@@ -986,7 +1005,7 @@ func volumeRequiresMountAPI(vol *types.ServiceVolumeVolume) bool {
 	}
 }
 
-func (s *composeService) buildContainerMountOptions(ctx context.Context, p types.Project, service types.ServiceConfig, inherit *container.Summary) ([]mount.Mount, error) {
+func (s *composeService) buildContainerMountOptions(ctx context.Context, p types.Project, service types.ServiceConfig, inherit *container.Summary, number int) ([]mount.Mount, error) {
 	mounts := map[string]mount.Mount{}
 	if inherit != nil {
 		for _, m := range inherit.Mounts {
@@ -1032,7 +1051,7 @@ func (s *composeService) buildContainerMountOptions(ctx context.Context, p types
 		}
 	}
 
-	mounts, err := fillBindMounts(p, service, mounts)
+	mounts, err := fillBindMounts(p, service, mounts, number)
 	if err != nil {
 		return nil, err
 	}
@@ -1044,9 +1063,9 @@ func (s *composeService) buildContainerMountOptions(ctx context.Context, p types
 	return values, nil
 }
 
-func fillBindMounts(p types.Project, s types.ServiceConfig, m map[string]mount.Mount) (map[string]mount.Mount, error) {
+func fillBindMounts(p types.Project, s types.ServiceConfig, m map[string]mount.Mount, number int) (map[string]mount.Mount, error) {
 	for _, v := range s.Volumes {
-		bindMount, err := buildMount(p, v)
+		bindMount, err := buildMountForReplica(p, v, number)
 		if err != nil {
 			return nil, err
 		}
@@ -1197,6 +1216,10 @@ func isWindowsAbs(p string) bool {
 }
 
 func buildMount(project types.Project, volume types.ServiceVolumeConfig) (mount.Mount, error) {
+	return buildMountForReplica(project, volume, 0)
+}
+
+func buildMountForReplica(project types.Project, volume types.ServiceVolumeConfig, number int) (mount.Mount, error) {
 	source := volume.Source
 	switch volume.Type {
 	case types.VolumeTypeBind:
@@ -1214,6 +1237,7 @@ func buildMount(project types.Project, volume types.ServiceVolumeConfig) (mount.
 			if ok {
 				source = pVolume.Name
 			}
+			source = resolveTaskSlot(source, number)
 		}
 	}
 
@@ -1234,6 +1258,34 @@ func buildMount(project types.Project, volume types.ServiceVolumeConfig) (mount.
 		TmpfsOptions:  tmpfs,
 		ImageOptions:  img,
 	}, nil
+}
+
+func hasTaskSlotTemplate(name string) bool {
+	return strings.Contains(name, taskSlotTemplate)
+}
+
+func resolveTaskSlot(name string, number int) string {
+	if number <= 0 || !hasTaskSlotTemplate(name) {
+		return name
+	}
+	return strings.ReplaceAll(name, taskSlotTemplate, strconv.Itoa(number))
+}
+
+func maxServiceScaleForVolume(project *types.Project, volumeKey string) int {
+	maxScale := 0
+	for _, service := range project.Services {
+		for _, v := range service.Volumes {
+			if v.Source != volumeKey {
+				continue
+			}
+			scale := service.GetScale()
+			if scale > maxScale {
+				maxScale = scale
+			}
+			break
+		}
+	}
+	return maxScale
 }
 
 func buildMountOptions(volume types.ServiceVolumeConfig) (*mount.BindOptions, *mount.VolumeOptions, *mount.TmpfsOptions, *mount.ImageOptions) {
